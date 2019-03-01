@@ -1,15 +1,20 @@
-import { DocumentNode, GraphQLError, ExecutionResult } from 'graphql';
+import { DocumentNode, GraphQLError, ExecutionResult } from 'graphql'
 import { isEqual } from 'apollo-utilities';
 import { InvariantError } from 'ts-invariant';
 import { NetworkStatus } from '../core/networkStatus';
+import { ExecutionPatchResult, isPatch } from '../core/types';
+import { hasDirectives } from 'apollo-utilities';
 
 export type QueryStoreValue = {
   document: DocumentNode;
+  isDeferred: boolean;
   variables: Object;
   previousVariables?: Object | null;
   networkStatus: NetworkStatus;
   networkError?: Error | null;
   graphQLErrors?: ReadonlyArray<GraphQLError>;
+  loadingState?: Record<string, any>;
+  compactedLoadingState?: Record<string, any>;
   metadata: any;
 };
 
@@ -87,6 +92,9 @@ export class QueryStore {
     // before the initial fetch is done, you'll get an error.
     this.store[query.queryId] = {
       document: query.document,
+      isDeferred: query.document.definitions
+        ? hasDirectives(['defer'], query.document)
+        : false,
       variables: query.variables,
       previousVariables,
       networkError: null,
@@ -111,18 +119,60 @@ export class QueryStore {
     }
   }
 
+  public markQueryComplete(queryId: string) {
+    if (!this.store[queryId]) return;
+    this.store[queryId].networkStatus = NetworkStatus.ready;
+  }
+
+  public updateLoadingState(
+    queryId: string,
+    loadingState: Record<string, any>,
+  ) {
+    if (!this.store[queryId]) return;
+    this.store[queryId].loadingState = loadingState;
+    this.store[queryId].compactedLoadingState = this.compactLoadingStateTree(
+      loadingState,
+    );
+  }
+
   public markQueryResult(
     queryId: string,
-    result: ExecutionResult,
+    result: ExecutionResult | ExecutionPatchResult,
     fetchMoreForQueryId: string | undefined,
+    isDeferred: boolean,
+    loadingState?: Record<string, any>,
   ) {
     if (!this.store || !this.store[queryId]) return;
+
+    // Store loadingState along with a compacted version of it
+    if (isDeferred && loadingState) {
+      this.store[queryId].loadingState = loadingState;
+      this.store[queryId].compactedLoadingState = this.compactLoadingStateTree(
+        loadingState,
+      );
+    }
+
+    if (isDeferred && isPatch(result)) {
+      // Merge graphqlErrors from patch, if any
+      if (result.errors) {
+        const errors: GraphQLError[] = [];
+        this.store[queryId].graphQLErrors!.forEach(error => {
+          errors.push(error);
+        });
+        result.errors.forEach(error => {
+          errors.push(error);
+        });
+        this.store[queryId].graphQLErrors = errors;
+      }
+    }
 
     this.store[queryId].networkError = null;
     this.store[queryId].graphQLErrors =
       result.errors && result.errors.length ? result.errors : [];
     this.store[queryId].previousVariables = null;
-    this.store[queryId].networkStatus = NetworkStatus.ready;
+    this.store[queryId].networkStatus = isDeferred
+      ? NetworkStatus.partial
+      : NetworkStatus.ready;
 
     // If we have a `fetchMoreForQueryId` then we need to update the network
     // status for that query. See the branch for query initialization for more
@@ -153,8 +203,20 @@ export class QueryStore {
     }
   }
 
-  public markQueryResultClient(queryId: string, complete: boolean) {
+  public markQueryResultClient(
+    queryId: string,
+    complete: boolean,
+    loadingState?: Record<string, any>,
+  ) {
     if (!this.store || !this.store[queryId]) return;
+
+    // Store loadingState if it is passed in
+    if (loadingState) {
+      this.store[queryId].loadingState = loadingState;
+      this.store[queryId].compactedLoadingState = this.compactLoadingStateTree(
+        loadingState,
+      );
+    }
 
     this.store[queryId].networkError = null;
     this.store[queryId].previousVariables = null;
@@ -185,5 +247,38 @@ export class QueryStore {
         },
         {} as { [queryId: string]: QueryStoreValue },
       );
+  }
+
+  /**
+   * Given a loadingState tree, it returns a compacted version of it that
+   * reduces the amount of boilerplate code required to access nested fields.
+   * The structure of this will mirror the response data, with deferred fields
+   * set to undefined until its patch is received.
+   */
+  private compactLoadingStateTree(
+    loadingState?: Record<string, any>,
+  ): Record<string, any> | undefined {
+    if (!loadingState) return loadingState;
+    const state: Record<string, any> = {};
+
+    for (let key in loadingState) {
+      const o = loadingState[key];
+      if (o._loading) {
+        continue;
+      }
+      if (o._children) {
+        if (Array.isArray(o._children)) {
+          state[key] = o._children.map((c: any) =>
+            this.compactLoadingStateTree(c),
+          );
+        } else {
+          state[key] = this.compactLoadingStateTree(o._children);
+        }
+        continue;
+      }
+      state[key] = true;
+    }
+
+    return state;
   }
 }

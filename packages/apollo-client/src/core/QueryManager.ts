@@ -1,5 +1,12 @@
 import { execute, ApolloLink, FetchResult } from 'apollo-link';
-import { ExecutionResult, DocumentNode } from 'graphql';
+import {
+  ExecutionResult,
+  DocumentNode,
+  SelectionNode,
+  FieldNode,
+  Kind,
+  FragmentDefinitionNode,
+} from 'graphql';
 import { DedupLink as Deduplicator } from 'apollo-link-dedup';
 import { Cache } from 'apollo-cache';
 import {
@@ -12,6 +19,7 @@ import {
   hasDirectives,
   graphQLResultHasError,
   hasClientExports,
+  cloneDeep,
 } from 'apollo-utilities';
 
 import { invariant } from 'ts-invariant';
@@ -35,6 +43,8 @@ import {
   ApolloQueryResult,
   FetchType,
   OperationVariables,
+  ExecutionPatchResult,
+  isPatch,
 } from './types';
 import { LocalState } from './LocalState';
 
@@ -463,9 +473,24 @@ export class QueryManager<TStore> {
     const shouldDispatchClientResult =
       !shouldFetch || fetchPolicy === 'cache-and-network';
     if (shouldDispatchClientResult) {
-      this.queryStore.markQueryResultClient(queryId, !shouldFetch);
+      const query = this.queryStore.get(queryId);
+
+      // Initialize loadingState with the cached results if it is a deferred query
+      let loadingState;
+      if (query.isDeferred) {
+        loadingState = this.initFieldLevelLoadingStates(query.document, {
+          data: storeResult,
+        });
+      }
+
+      this.queryStore.markQueryResultClient(
+        queryId,
+        !shouldFetch,
+        loadingState,
+      );
+
       this.invalidate(true, queryId, fetchMoreForQueryId);
-      this.broadcastQueries(this.localState.shouldForceResolvers(query));
+      this.broadcastQueries(this.localState.shouldForceResolvers(query.document));
     }
 
     if (shouldFetch) {
@@ -665,6 +690,7 @@ export class QueryManager<TStore> {
               loading: isNetworkRequestInFlight(queryStoreValue.networkStatus),
               networkStatus: queryStoreValue.networkStatus,
               stale: true,
+              loadingState: queryStoreValue.loadingState,
             };
           } else {
             resultFromStore = {
@@ -672,6 +698,7 @@ export class QueryManager<TStore> {
               loading: isNetworkRequestInFlight(queryStoreValue.networkStatus),
               networkStatus: queryStoreValue.networkStatus,
               stale: false,
+              loadingState: queryStoreValue.loadingState,
             };
           }
 
@@ -685,11 +712,18 @@ export class QueryManager<TStore> {
           }
 
           if (observer.next) {
-            if (
+            const isDifferentResult = !(
               previouslyHadError ||
               !observableQuery ||
-              observableQuery.isDifferentFromLastResult(resultFromStore)
-            ) {
+              observableQuery.isDifferentFromLastResult(resultFromStore) ||
+              resultFromStore.loadingState
+              // If loadingState is present, this is a patch from a deferred
+              // query, and we should always treat it as a different result
+              // even though the actual data might be the same (i.e. the patch's
+              // data could be null).
+            );
+
+            if (isDifferentResult) {
               try {
                 // Local resolvers can be forced by using
                 // `@client(always: true)` syntax. If any resolvers are
@@ -1132,30 +1166,50 @@ export class QueryManager<TStore> {
   } {
     const { variables, query, fetchPolicy } = observableQuery.options;
     const lastResult = observableQuery.getLastResult();
-    const { newData } = this.getQuery(observableQuery.queryId);
-
+    const { newData, document } = this.getQuery(observableQuery.queryId);
+    const isDeferred =
+      document !== null ? hasDirectives(['defer'], document) : false;
     // XXX test this
     if (newData && newData.complete) {
       return { data: newData.result, partial: false };
     } else if (fetchPolicy === 'no-cache' || fetchPolicy === 'network-only') {
       return { data: undefined, partial: false };
     } else {
-      try {
-        // the query is brand new, so we read from the store to see if anything is there
-        const data =
-          this.dataStore.getCache().read<T>({
-            query,
-            variables,
-            previousResult: lastResult ? lastResult.data : undefined,
-            optimistic,
-          }) || undefined;
+      if (isDeferred) {
+        // For deferred queries, we actually want to use partial data
+        // since certain fields might still be streaming in.
+        // Setting returnPartialData to true so that
+        // an error does not get thrown if fields are missing.
+        const diffResult = this.dataStore.getCache().diff<T>({
+          query,
+          variables,
+          previousResult: lastResult ? lastResult.data : undefined,
+          optimistic,
+          returnPartialData: true,
+        });
 
-        return { data, partial: false };
-      } catch (e) {
-        return { data: undefined, partial: true };
+        return {
+          data: diffResult.result,
+          partial: !diffResult.complete,
+        };
+      } else {
+        try {
+          // the query is brand new, so we read from the store to see if anything is there
+            const data = this.dataStore.getCache().read<T>({
+              query,
+              variables,
+              previousResult: lastResult ? lastResult.data : undefined,
+              optimistic,
+            }) || undefined;
+
+          return { data, partial: false };
+        } catch (e) {
+          return { data: undefined, partial: true };
+        }
       }
     }
   }
+
 
   public getQueryWithPreviousResult<T>(
     queryIdOrObservable: string | ObservableQuery<T>,
@@ -1198,6 +1252,18 @@ export class QueryManager<TStore> {
         // See here for more detail: https://github.com/apollostack/apollo-client/issues/231
         .filter((x: QueryListener) => !!x)
         .forEach((listener: QueryListener) => {
+          if (info.newData) {
+            // Make sure that loadingState is updated for deferred queries
+            const queryStoreValue = this.queryStore.get(id);
+            if (queryStoreValue && queryStoreValue.isDeferred) {
+              this.queryStore.updateLoadingState(
+                id,
+                this.initFieldLevelLoadingStates(queryStoreValue.document, {
+                  data: info.newData.result,
+                }),
+              );
+            }
+          }
           listener(this.queryStore.get(id), info.newData, forceResolvers);
         });
     });
@@ -1230,6 +1296,47 @@ export class QueryManager<TStore> {
     return observableQueryPromises;
   }
 
+  /**
+   * Given a loadingState tree, update it with the patch by traversing its path
+   */
+  private updateLoadingState(
+    curLoadingState: Record<string, any>,
+    result: ExecutionPatchResult,
+  ) {
+    const path = result.path;
+    let index = 0;
+    const copy = cloneDeep(curLoadingState);
+    let curPointer = copy;
+    while (index < path.length) {
+      const key = path[index++];
+      if (curPointer && curPointer[key]) {
+        curPointer = curPointer[key];
+        if (index === path.length) {
+          // Reached the leaf node
+          if (Array.isArray(result.data)) {
+            // At the time of instantiating the loadingState from the query AST,
+            // we have no way of telling if a field is an array type. Therefore,
+            // once we receive a patch that has array data, we need to update the
+            // loadingState with an array with the appropriate number of elements.
+
+            const children = cloneDeep(curPointer!._children);
+            const childrenArray = [];
+            for (let i = 0; i < result.data.length; i++) {
+              childrenArray.push(children);
+            }
+            curPointer!._children = childrenArray;
+          }
+          curPointer!._loading = false;
+          break;
+        }
+        if (curPointer && curPointer!._children) {
+          curPointer = curPointer!._children;
+        }
+      }
+    }
+    return copy;
+  }
+
   // Takes a request id, query id, a query document and information associated with the query
   // and send it to the network interface. Returns
   // a promise for the result associated with that request.
@@ -1247,8 +1354,10 @@ export class QueryManager<TStore> {
     fetchMoreForQueryId?: string;
   }): Promise<FetchResult<T>> {
     const { variables, context, errorPolicy = 'none', fetchPolicy } = options;
+    const isDeferred = hasDirectives(['defer'], document);
     let resultFromStore: any;
     let errorsFromStore: any;
+    let curLoadingState: Record<string, any>;
 
     return new Promise<ApolloQueryResult<T>>((resolve, reject) => {
       let obs: Observable<FetchResult>;
@@ -1260,6 +1369,7 @@ export class QueryManager<TStore> {
         const operation = this.buildOperationForLink(serverQuery, variables, {
           ...context,
           forceFetch: !this.queryDeduplication,
+          isDeferred,
         });
         updatedContext = operation.context;
         obs = execute(this.deduplicator, operation);
@@ -1274,10 +1384,9 @@ export class QueryManager<TStore> {
       let handlingNext = true;
 
       const subscriber = {
-        next: async (result: ExecutionResult) => {
+        next: async (result: ExecutionResult | ExecutionPatchResult) => {
           handlingNext = true;
           let updatedResult = result;
-
           // default the lastRequestId to 1
           const { lastRequestId } = this.getQuery(queryId);
           if (requestId >= (lastRequestId || 1)) {
@@ -1317,10 +1426,29 @@ export class QueryManager<TStore> {
               }));
             }
 
+            // Initialize a tree of individual loading states for each deferred
+            // field, when the initial response arrives.
+            if (isDeferred && !isPatch(result)) {
+              curLoadingState = this.initFieldLevelLoadingStates(
+                document,
+                result,
+              );
+            }
+
+            if (isDeferred && isPatch(result)) {
+              // Update loadingState for every patch received, by traversing its path
+              curLoadingState = this.updateLoadingState(
+                curLoadingState,
+                result,
+              );
+            }
+
             this.queryStore.markQueryResult(
               queryId,
               updatedResult,
               fetchMoreForQueryId,
+              isDeferred,
+              curLoadingState,
             );
 
             this.invalidate(true, queryId, fetchMoreForQueryId);
@@ -1351,6 +1479,7 @@ export class QueryManager<TStore> {
                 variables,
                 query: document,
                 optimistic: false,
+                returnPartialData: isDeferred,
               });
               // this will throw an error if there are missing fields in
               // the results which can happen with errors from the server.
@@ -1373,6 +1502,12 @@ export class QueryManager<TStore> {
           reject(error);
         },
         complete: () => {
+          if (isDeferred) {
+            this.queryStore.markQueryComplete(queryId);
+            this.invalidate(true, queryId, fetchMoreForQueryId);
+            this.broadcastQueries();
+          }
+
           if (!handlingNext) {
             this.fetchQueryRejectFns.delete(`fetchRequest:${queryId}`);
 
@@ -1386,6 +1521,7 @@ export class QueryManager<TStore> {
               loading: false,
               networkStatus: NetworkStatus.ready,
               stale: false,
+              loadingState: curLoadingState,
             });
           }
           complete = true;
@@ -1610,5 +1746,166 @@ export class QueryManager<TStore> {
         }
       }, timeLimitMs),
     };
+  }
+
+  /**
+   * Given a DocumentNode, traverse the tree and initialize loading states for
+   * all fields. Deferred fields are initialized with `_loading` set to true.
+   */
+  private initFieldLevelLoadingStates(
+    doc: DocumentNode,
+    result: ExecutionResult,
+  ) {
+    // Collect all the fragment definitions
+    const fragmentMap: Record<string, ReadonlyArray<SelectionNode>> = {};
+    doc.definitions
+      .filter(definition => definition.kind === Kind.FRAGMENT_DEFINITION)
+      .forEach(definition => {
+        const fragmentName = (definition as FragmentDefinitionNode).name.value;
+        fragmentMap[
+          fragmentName
+        ] = (definition as FragmentDefinitionNode).selectionSet.selections;
+      });
+
+    const operationDefinition = doc.definitions.filter(
+      definition => definition.kind === Kind.OPERATION_DEFINITION,
+    )[0]; // Take the first element since we do not support multiple operations
+
+    return (this.createLoadingStateTree(
+      operationDefinition as any,
+      fragmentMap,
+      result.data,
+    ) as Record<string, any>)._children;
+  }
+
+  /**
+   * Recursive function that extracts a tree that mirrors the shape of the query,
+   * adding _loading property to fields which are deferred. Expands
+   * FragmentSpread according to the fragment map that is passed in.
+   * The actual data from the initial response is passed in so that we can
+   * reference the query schema against the data, and handle arrays that we find.
+   * In the case where a partial result is passed in (might be retrieved from
+   * cache), it would set the `_loading` states depending on which fields are
+   * available.
+   */
+  private createLoadingStateTree(
+    selection: SelectionNode,
+    fragmentMap: Record<string, any>,
+    data: Record<string, any> | undefined,
+  ): Record<string, any> | boolean {
+    const hasDeferDirective: boolean = (selection.directives &&
+      selection.directives.length > 0 &&
+      selection.directives.findIndex(directive => {
+        return directive.name.value === 'defer';
+      }) !== -1) as boolean;
+    const isLeaf: boolean =
+      selection.kind !== Kind.INLINE_FRAGMENT &&
+      (!(selection as FieldNode).selectionSet ||
+        (selection as FieldNode).selectionSet!.selections.length === 0);
+
+    const isLoaded = data !== undefined && data !== null;
+    if (isLeaf) {
+      return hasDeferDirective ? { _loading: !isLoaded } : false;
+    }
+
+    const map: { _loading?: boolean; _children?: Record<string, any> } = {
+      _loading: hasDeferDirective ? !isLoaded : false,
+      _children: undefined,
+    };
+
+    // Extract child selections, replacing FragmentSpreads with its actual selectionSet
+    const selections: SelectionNode[] = [];
+    const expandedFragments: SelectionNode[] = [];
+    (selection as FieldNode).selectionSet!.selections.forEach(
+      childSelection => {
+        if (childSelection.kind === Kind.FRAGMENT_SPREAD) {
+          const fragmentName = childSelection.name.value;
+          fragmentMap[fragmentName].forEach((selection: SelectionNode) => {
+            expandedFragments.push(selection);
+          });
+        } else {
+          selections.push(childSelection);
+        }
+      },
+    );
+
+    // Add expanded FragmentSpreads to the current selection set
+    expandedFragments.forEach(fragSelection => {
+      const fragFieldName = (fragSelection as FieldNode).name.value;
+      let existingSelection = selections.find(
+        selection =>
+          selection.kind !== Kind.INLINE_FRAGMENT &&
+          (selection as FieldNode).name.value === fragFieldName,
+      );
+      if (existingSelection) {
+        const fragSelectionHasDefer =
+          fragSelection.directives &&
+          fragSelection.directives.findIndex(
+            directive => directive.name.value === 'defer',
+          ) >= 0;
+        if (!fragSelectionHasDefer) {
+          // Make sure that the existingSelection is not deferred, since all
+          // selections of the field must specify defer in order for the field
+          // to be deferred. This should match the behavior on apollo-server.
+          if (existingSelection.directives) {
+            const newDirectives = existingSelection.directives.filter(
+              directive => directive.name.value !== 'defer',
+            );
+
+            existingSelection = {...selection, directives: newDirectives}
+          }
+        }
+      } else {
+        // Add it to the selectionSet
+        selections.push(fragSelection);
+      }
+    });
+
+    // Initialize loadingState recursively for childSelections
+    for (const childSelection of selections) {
+      if (childSelection.kind === Kind.INLINE_FRAGMENT) {
+        const subtree = this.createLoadingStateTree(
+          childSelection,
+          fragmentMap,
+          data,
+        );
+        // Inline fragment node cannot be a leaf node, must have children
+        map._children = Object.assign(
+          map._children || {},
+          (subtree as Record<string, any>)._children,
+        );
+      } else {
+        const childName = (childSelection as FieldNode).name.value;
+        let childData;
+        let isArray = false;
+        if (data) {
+          childData = data[childName];
+          isArray = Array.isArray(childData);
+        }
+
+        if (!map._children) map._children = {};
+        if (isArray) {
+          // Make sure that the shape of loadingState matches the shape of the
+          // data. If an array is returned for a field, the loadingState should
+          // be initialized with the correct number of elements.
+          const subtreeArr = childData.map((d: any) => {
+            const subtree = this.createLoadingStateTree(
+              childSelection,
+              fragmentMap,
+              d,
+            );
+            return typeof subtree === 'boolean' ? subtree : subtree._children;
+          });
+          map._children[childName] = { _children: subtreeArr };
+        } else {
+          map._children[childName] = this.createLoadingStateTree(
+            childSelection,
+            fragmentMap,
+            childData,
+          );
+        }
+      }
+    }
+    return map;
   }
 }

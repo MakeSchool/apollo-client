@@ -30,6 +30,7 @@ import ApolloClient, {
   ApolloClientOptions,
   DefaultOptions,
 } from './ApolloClient';
+
 export { ApolloClientOptions, DefaultOptions };
 
 // Export the client as both default and named.

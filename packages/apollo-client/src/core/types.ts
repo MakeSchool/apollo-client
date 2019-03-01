@@ -1,6 +1,5 @@
 import { FetchResult } from 'apollo-link';
-import { DocumentNode, GraphQLError } from 'graphql';
-
+import { DocumentNode, ExecutionResult, GraphQLError } from 'graphql';
 import { QueryStoreValue } from '../data/queries';
 import { NetworkStatus } from './networkStatus';
 
@@ -24,6 +23,7 @@ export type ApolloQueryResult<T> = {
   loading: boolean;
   networkStatus: NetworkStatus;
   stale: boolean;
+  loadingState?: Record<string, any>;
 };
 
 export enum FetchType {
@@ -55,4 +55,20 @@ export interface Resolvers {
       info?: any,
     ) => any;
   };
+}
+
+/**
+ * Define a new type for patches that are sent as a result of using defer.
+ * It is basically the same as ExecutionResult, except that it has a "path"
+ * field that keeps track of the where the patch is to be merged with the
+ * original result.
+ */
+export interface ExecutionPatchResult extends ExecutionResult {
+  path: (string | number)[];
+}
+
+export function isPatch(
+  data: ExecutionResult | ExecutionPatchResult,
+): data is ExecutionPatchResult {
+  return (data as ExecutionPatchResult).path !== undefined;
 }

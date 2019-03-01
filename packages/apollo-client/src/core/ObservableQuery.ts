@@ -1,20 +1,21 @@
 import { isEqual, tryFunctionOrLogError, cloneDeep } from 'apollo-utilities';
 import { GraphQLError } from 'graphql';
-import { NetworkStatus, isNetworkRequestInFlight } from './networkStatus';
+import { isNetworkRequestInFlight, NetworkStatus } from './networkStatus';
 import { Observable, Observer, Subscription } from '../util/Observable';
 import { ApolloError } from '../errors/ApolloError';
 import { QueryManager } from './QueryManager';
 import { ApolloQueryResult, FetchType, OperationVariables } from './types';
 import {
-  ModifiableWatchQueryOptions,
-  WatchQueryOptions,
-  FetchMoreQueryOptions,
-  SubscribeToMoreOptions,
   ErrorPolicy,
+  FetchMoreQueryOptions,
+  ModifiableWatchQueryOptions,
+  SubscribeToMoreOptions,
   UpdateQueryFn,
+  WatchQueryOptions,
 } from './watchQueryOptions';
 
 import { QueryStoreValue } from '../data/queries';
+import { hasDirectives } from 'apollo-utilities';
 
 import { invariant } from 'ts-invariant';
 
@@ -37,6 +38,17 @@ export type ApolloCurrentQueryResult<T> = {
   error?: ApolloError;
   partial?: boolean;
   stale?: boolean;
+  loadingState?: T | {};
+  // loadingState is exposed to the client for deferred queries, with a shape
+  // that mirrors that of the data, but instead of the leaf nodes being
+  // GraphQLOutputType, it is (undefined | boolean).
+  // Right now, we have not accounted for this difference, but I think it is
+  // still usable in the context of checking for the presence of a field.
+  //
+  // TODO: Additional work needs to be done in `apollo-codegen-core` to generate
+  // a separate type for the loadingState, which will then be passed in as
+  // follows - ApolloCurrentResult<T, LoadingStateType>
+  // Open issue here: https://github.com/apollographql/apollo-cli/issues/539
 };
 
 export interface FetchMoreOptions<
@@ -246,6 +258,17 @@ export class ObservableQuery<
       this.options.errorPolicy === 'all'
     ) {
       result.errors = queryStoreValue.graphQLErrors;
+    }
+
+    if (queryStoreValue) {
+      result.loadingState = queryStoreValue.compactedLoadingState;
+    } else {
+      if (hasDirectives(['defer'], this.options.query)) {
+        // Make sure that we have loadingState for deferred queries
+        // If the queryStore has not been initialized, set loading to true and
+        // wait for the next update.
+        result.loading = true;
+      }
     }
 
     if (!partial) {
