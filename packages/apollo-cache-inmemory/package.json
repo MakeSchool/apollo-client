@@ -45,8 +45,8 @@
     "access": "public"
   },
   "dependencies": {
-    "apollo-cache": "file:../apollo-cache",
-    "apollo-utilities": "file:../apollo-utilities",
+    "apollo-cache": "alpha",
+    "apollo-utilities": "alpha",
     "optimism": "^0.6.9",
     "tslib": "^1.9.3"
   },

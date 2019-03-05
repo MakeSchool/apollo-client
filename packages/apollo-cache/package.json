@@ -42,7 +42,7 @@
     "access": "public"
   },
   "dependencies": {
-    "apollo-utilities": "file:../apollo-utilities",
+    "apollo-utilities": "alpha",
     "tslib": "^1.9.3"
   },
   "jest": {
