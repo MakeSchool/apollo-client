@@ -43,7 +43,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "apollo-utilities": "alpha",
+    "@rmosolgo/apollo-utilities": "alpha",
     "tslib": "^1.9.3"
   },
   "jest": {
