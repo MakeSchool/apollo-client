@@ -20,11 +20,12 @@ $ # installs dependencies and compiles typescript
 
 #### Installing from local files
 
-Add to your `package.json`:
+Add to your `package.json`, for example, `apollo-boost`:
 
 ```js
   "apollo-boost": "file:./path/to/apollo-client/packages/apollo-boost",
 ```
 
+(If you need specific other packages, do the same thing for those other packages.)
 
 Then, `yarn install`.
